@@ -1,4 +1,4 @@
-// V3
+// V4
 (function () {
     // Debug flag - will help us see if the error handler is working
     console.log("Error handler initializing...");
@@ -22,20 +22,6 @@
             },
             on: function() {}
         };
-    }
-    
-    // Force error emission - bypasses potential socket issues
-    function forceEmitError(errorInfo) {
-        try {
-            // This creates a direct POST request to ensure errors are reported
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/error', true);
-            xhr.setRequestHeader('Content-Type', 'application/json');
-            xhr.send(JSON.stringify(errorInfo));
-            console.log("Force-emitted error via XHR:", errorInfo.message);
-        } catch (e) {
-            console.log("Failed to force-emit error:", e);
-        }
     }
     
     // Function to extract and clean stack trace
@@ -79,9 +65,6 @@
         } catch (e) {
             console.log("Socket reconnection failed:", e);
         }
-        
-        // Method 3: Force emission with XHR
-        forceEmitError(errorInfo);
         
         return false;
     }
