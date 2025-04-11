@@ -1,45 +1,89 @@
-// V2
+// V3
 (function () {
+    // Debug flag - will help us see if the error handler is working
+    console.log("Error handler initializing...");
+    
     const originalConsoleError = console.error;
     let errorSocket;
     
-    // Initialize socket with error handling
+    // Make sure we have a working socket immediately
     try {
-        errorSocket = io(location.origin);
+        // Try to use existing socket if available (game might already have one)
+        errorSocket = window.socket || io(location.origin);
+        console.log("Error handler using socket:", errorSocket.connected ? "connected" : "disconnected");
     } catch (e) {
         console.log('Error initializing error socket:', e);
-        // Fall back to a basic error socket that queues errors
         errorSocket = {
             connected: false,
             queue: [],
             emit: function(event, data) {
+                console.log("Queued error (socket not ready):", data);
                 this.queue.push({event, data});
-                if (this.queue.length > 20) this.queue.shift(); // Prevent memory leaks
             },
-            on: function() {} // No-op
+            on: function() {}
         };
     }
-
-    // Function to extract stack trace
+    
+    // Force error emission - bypasses potential socket issues
+    function forceEmitError(errorInfo) {
+        try {
+            // This creates a direct POST request to ensure errors are reported
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/error', true);
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.send(JSON.stringify(errorInfo));
+            console.log("Force-emitted error via XHR:", errorInfo.message);
+        } catch (e) {
+            console.log("Failed to force-emit error:", e);
+        }
+    }
+    
+    // Function to extract and clean stack trace
     function getStackTrace(error) {
         if (!error || !error.stack) return '';
         return error.stack;
     }
 
-    // Function to send error to server
+    // Function to send error to server - with multiple fallbacks
     function sendError(errorInfo) {
+        console.log("Attempting to send error:", errorInfo.message);
+        
+        // Method 1: Use socket if connected
         try {
-            if (errorSocket.connected) {
+            if (errorSocket && errorSocket.connected) {
                 errorSocket.emit('error', errorInfo);
+                console.log("Emitted error via connected socket");
+                return true;
+            }
+        } catch (e) {
+            console.log("Socket emit failed:", e);
+        }
+        
+        // Method 2: Try reconnecting socket
+        try {
+            // Try to get socket again - it might be available now
+            const socket = window.socket || io(location.origin);
+            if (socket && socket.connected) {
+                socket.emit('error', errorInfo);
+                console.log("Emitted error via reconnected socket");
+                return true;
             } else {
-                errorSocket.on('connect', () => {
-                    errorSocket.emit('error', errorInfo);
+                console.log("Socket still not connected, trying one-time connection");
+                
+                // If socket exists but not connected, try the connect event
+                socket.on('connect', () => {
+                    socket.emit('error', errorInfo);
+                    console.log("Emitted error on socket connect");
                 });
             }
         } catch (e) {
-            // Last resort - at least log that we tried
-            originalConsoleError('Failed to send error to server:', e);
+            console.log("Socket reconnection failed:", e);
         }
+        
+        // Method 3: Force emission with XHR
+        forceEmitError(errorInfo);
+        
+        return false;
     }
 
     // Function to show error toast
@@ -69,47 +113,111 @@
                 }
             }, 5000);
         } catch (e) {
-            // Silently fail - we don't want errors in the error handler
+            console.log("Error showing toast:", e);
         }
     }
 
-    // Override console.error
-    console.error = function () {
-        // Call the original console.error first
-        originalConsoleError.apply(console, arguments);
+    // Override console.error - but don't override if it was already custom
+    if (console.error === originalConsoleError) {
+        console.error = function () {
+            // Call the original console.error first
+            originalConsoleError.apply(console, arguments);
 
+            try {
+                const errorText = Array.from(arguments).join(' ');
+                let stack = '';
+                
+                // Check if the first argument is an Error object
+                if (arguments[0] instanceof Error) {
+                    stack = getStackTrace(arguments[0]);
+                }
+                
+                const errorInfo = {
+                    type: 'console_error',
+                    message: errorText,
+                    stack: stack,
+                    timestamp: Date.now(),
+                    url: window.location.href,
+                    gameId: new URLSearchParams(window.location.search).get('gameId'),
+                    roomId: new URLSearchParams(window.location.search).get('roomId'),
+                    userId: new URLSearchParams(window.location.search).get('userId')
+                };
+
+                sendError(errorInfo);
+                showErrorToast('Error Detected: ' + errorText.substring(0, 50) + (errorText.length > 50 ? '...' : ''));
+            } catch (e) {
+                originalConsoleError('Error in error handler:', e);
+            }
+        };
+    } else {
+        console.log("console.error was already overridden, not replacing");
+    }
+
+    // Direct patching of the renderGame function if it exists
+    function patchGameFunctions() {
         try {
-            const errorText = Array.from(arguments).join(' ');
-            let stack = '';
-            
-            // Check if the first argument is an Error object
-            if (arguments[0] instanceof Error) {
-                stack = getStackTrace(arguments[0]);
+            // Wait for the renderGame function to be defined
+            if (typeof window.renderGame === 'function') {
+                const originalRenderGame = window.renderGame;
+                window.renderGame = function() {
+                    try {
+                        return originalRenderGame.apply(this, arguments);
+                    } catch (error) {
+                        const errorInfo = {
+                            type: 'game_function_error',
+                            message: error.message,
+                            stack: getStackTrace(error),
+                            timestamp: Date.now(),
+                            url: window.location.href,
+                            function: 'renderGame',
+                            gameId: new URLSearchParams(window.location.search).get('gameId'),
+                            roomId: new URLSearchParams(window.location.search).get('roomId'),
+                            userId: new URLSearchParams(window.location.search).get('userId')
+                        };
+                        sendError(errorInfo);
+                        showErrorToast('Game Error: ' + error.message);
+                        throw error; // rethrow
+                    }
+                };
+                console.log("Successfully patched renderGame function");
+            } else {
+                console.log("renderGame function not found, will try again");
+                setTimeout(patchGameFunctions, 500); // Try again after 500ms
             }
             
-            const errorInfo = {
-                type: 'console_error',
-                message: errorText,
-                stack: stack,
-                timestamp: Date.now(),
-                url: window.location.href,
-                gameId: new URLSearchParams(window.location.search).get('gameId'),
-                roomId: new URLSearchParams(window.location.search).get('roomId'),
-                userId: new URLSearchParams(window.location.search).get('userId')
-            };
-
-            sendError(errorInfo);
-            showErrorToast('Error Detected! Check console.');
+            // Do the same for drawFruit which appears in the stack trace
+            if (typeof window.drawFruit === 'function') {
+                const originalDrawFruit = window.drawFruit;
+                window.drawFruit = function() {
+                    try {
+                        return originalDrawFruit.apply(this, arguments);
+                    } catch (error) {
+                        const errorInfo = {
+                            type: 'game_function_error',
+                            message: error.message,
+                            stack: getStackTrace(error),
+                            timestamp: Date.now(),
+                            url: window.location.href,
+                            function: 'drawFruit',
+                            gameId: new URLSearchParams(window.location.search).get('gameId'),
+                            roomId: new URLSearchParams(window.location.search).get('roomId'),
+                            userId: new URLSearchParams(window.location.search).get('userId')
+                        };
+                        sendError(errorInfo);
+                        showErrorToast('Game Error: ' + error.message);
+                        throw error; // rethrow
+                    }
+                };
+                console.log("Successfully patched drawFruit function");
+            }
         } catch (e) {
-            // Fallback if our error handling has errors
-            originalConsoleError('Error in error handler:', e);
+            console.log("Error patching game functions:", e);
         }
-    };
+    }
 
     // Capture global errors
     window.addEventListener('error', function (event) {
         try {
-            // Don't process if it's not an actual error (like a resource loading error)
             if (!(event instanceof ErrorEvent)) return;
             
             const errorObj = event.error || {};
@@ -130,9 +238,8 @@
             };
 
             sendError(errorInfo);
-            showErrorToast(`Uncaught Error: ${event.message}`);
+            showErrorToast(`Error: ${event.message}`);
         } catch (e) {
-            // Fallback for errors in the error handler
             originalConsoleError('Error in error event handler:', e);
         }
     }, true);
@@ -164,43 +271,14 @@
             };
 
             sendError(errorInfo);
-            showErrorToast(`Unhandled Promise Rejection: ${message}`);
+            showErrorToast(`Promise Error: ${message}`);
         } catch (e) {
-            // Fallback for errors in the rejection handler
             originalConsoleError('Error in promise rejection handler:', e);
         }
     });
-
-    // Patch major browser functions to catch more errors
-    const patchFunction = (obj, funcName) => {
-        const original = obj[funcName];
-        if (typeof original !== 'function') return;
-        
-        obj[funcName] = function() {
-            try {
-                return original.apply(this, arguments);
-            } catch (error) {
-                console.error(`Error in ${funcName}:`, error);
-                throw error; // Re-throw so the error propagates
-            }
-        };
-    };
-
-    // Patch key methods that might cause errors
-    try {
-        // Patch setTimeout and setInterval
-        patchFunction(window, 'setTimeout');
-        patchFunction(window, 'setInterval');
-        
-        // Patch event listener methods
-        patchFunction(EventTarget.prototype, 'addEventListener');
-        patchFunction(EventTarget.prototype, 'removeEventListener');
-        
-        // Patch requestAnimationFrame
-        patchFunction(window, 'requestAnimationFrame');
-    } catch (e) {
-        // Ignore patching errors - they're not critical
-    }
+    
+    // Start trying to patch game functions after a short delay
+    setTimeout(patchGameFunctions, 500);
     
     console.log('Enhanced error detection initialized');
 })();
